@@ -1,47 +1,51 @@
-# WaxOff — Interactive CLI (Stereo Leveler with WAV/MP3/FLAC)
+# WaxOff (CLI)
+**Fast, safe audio cleanup and reversal** — prepares DAW‑ready dialogue, undoing preprocessing or restoring raw dynamics for post work.
 
-**WaxOff** is the **final** step before delivery. It takes your edited stereo mix and:
-- Runs **two-pass** BS.1770/EBU R128 to **−18 LUFS** (recommended) or **−16 LUFS**  
-- True peak set to **−1.0 dBTP**  
-- Exports **WAV (24-bit)**, **MP3 (128/160/192 kbps)**, **FLAC (level 0–12)**  
-- 44.1 k or 48 k sample rate  
-- Hidden temp writes, atomic reveal  
-- **Interactive file picker** if started with no filenames  
-- **Live console output** mirrored to a log via `tee`
+WaxOff complements WaxOn by reversing its effects or cleaning processed audio. It provides clip repair, normalization rollback, and re‑expansion utilities.
 
-> **Upstream:** Prep your sources first with **[WaxOn](https://github.com/sevmorris/WaxOn)**.
+---
 
-## Requirements
+## 🧩 Install
 
+This project installs by cloning to your home directory and creating a symlink in `~/bin` (or `~/.local/bin`).
+
+### Quick install
 ```bash
-brew install ffmpeg
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/sevmorris/WaxOff/main/install.sh)"
 ```
 
-## Install (user)
-
+### Verify installation
 ```bash
-mkdir -p ~/bin && curl -fsSL https://raw.githubusercontent.com/sevmorris/WaxOff/refs/heads/main/waxoff -o ~/bin/waxoff && chmod +x ~/bin/waxoff && case ":$PATH:" in *":$HOME/bin:"*) :;; *) echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && export PATH="$HOME/bin:$PATH";; esac && echo "Installed waxoff -> ~/bin/waxoff"
+waxoff -h
 ```
 
-## Dev setup
-
+If `~/bin` isn’t in your PATH:
 ```bash
-git clone https://github.com/sevmorris/WaxOff.git
-cd WaxOff
-chmod +x waxoff
-./waxoff --help
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc
 ```
 
-## Quick start
-
+### Uninstall (symlink only)
 ```bash
-waxoff
-waxoff *.wav
-waxoff -t -18 -m all -b 192k --samplerate 48000 mix.wav
+~/WaxOff/uninstall.sh
 ```
 
-## Workflow
+---
 
-1. **WaxOn** → clean/prep mono files to −25 LUFS.  
-2. **Mix/edit** in DAW.  
-3. **WaxOff** → finalize and export deliverables.
+## 🧰 Behavior
+
+- Clones repo to `~/WaxOff`
+- Creates symlink `waxoff` in `~/bin` (or `~/.local/bin`)
+- Idempotent: can be re‑run to update both repo and symlink
+
+---
+
+## ⚙️ Dependencies
+
+- `bash`, `git`
+- `ffmpeg`
+
+---
+
+## 🧾 License
+
+MIT License © Seven Morris
