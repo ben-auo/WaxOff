@@ -65,7 +65,7 @@ done
 is_int() { [[ "$1" =~ ^-?[0-9]+$ ]]; }
 is_choice() { local v="$1"; shift; for c in "$@"; do [[ "$v" == "$c" ]] && return 0; done; return 1; }
 
-# ---- macOS file picker ----
+# ---- macOS file picker (only when interactive & no args) ----
 pick_files_macos() {
   /usr/bin/osascript <<'OSA' 2>/dev/null
 set fp to choose file with prompt "Select one or more audio files for WaxOff:" with multiple selections allowed
@@ -127,8 +127,8 @@ confirm() {
   echo "Selections:"
   echo "  Target:  ${TARGET_I} LUFS (TP −1 dBTP)"
   echo "  Mode:    ${OUTMODE}"
-  [[ "$OUTMODE" =~ mp3|both|all ]] && echo "  MP3:     ${MP3_BITRATE}"
-  [[ "$OUTMODE" =~ flac|wav\+flac|all ]] && echo "  FLAC:    level ${FLAC_LEVEL}"
+  [[ "$OUTMODE" =~ ^(mp3|both|all)$ ]] && echo "  MP3:     ${MP3_BITRATE}"
+  [[ "$OUTMODE" =~ ^(flac|wav\+flac|all)$ ]] && echo "  FLAC:    level ${FLAC_LEVEL}"
   echo "  Sample:  ${SAMPLE_RATE} Hz"
   read -r -p "Proceed? [Y/n]: " yn; case "${yn:-Y}" in Y|y) : ;; *) echo "Cancelled."; exit 0 ;; esac
 }
@@ -175,7 +175,9 @@ extract_json_num() { local f="$1" key="$2"; LC_ALL=C sed -nE "s/.*\"${key}\"[[:s
 spotcheck_file() {
   local F="$1" OUT="$2" J
   J="$(mktemp -t waxoff_sc.XXXXXX.json 2>/dev/null || echo "/tmp/waxoff_sc.$RANDOM.json")"
-  "$FFMPEG" -hide_banner -nostats -y -i "$F"         -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:print_format=json"         -f null - 2> "$J"
+  "$FFMPEG" -hide_banner -nostats -y -i "$F" \
+    -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:print_format=json" \
+    -f null - 2> "$J"
   if [[ $? -ne 0 ]]; then
     echo "I=n/a TP=n/a" > "$OUT"
   else
@@ -199,8 +201,10 @@ progress_draw() {  # $1=label  $2=pct (0..100)
   printf "%${pad}s" ""  >"$TTY_OUT"
   printf "] %3d%%" "$pct" >"$TTY_OUT"
 }
-ffprobe_duration_s() { command -v ffprobe >/dev/null 2>&1 || { echo 0; return; }
-  local dur; dur="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | head -n1)"
+ffprobe_duration_s() {
+  if ! command -v ffprobe >/dev/null 2>&1; then echo 0; return; fi
+  local dur
+  dur="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | head -n1)"
   [ -n "$dur" ] && echo "$dur" || echo 0
 }
 ffmpeg_with_progress() {
@@ -231,6 +235,7 @@ ffmpeg_with_progress() {
   return $rc
 }
 
+# ---- Main loop ----
 TEMP_FILES=(); trap 'for f in "${TEMP_FILES[@]:-}"; do [[ -e "$f" ]] && rm -f "$f"; done' EXIT INT TERM
 
 TOTAL=${#args[@]}; INDEX=0; OKC=0; FAILED=0; SKIPPED=0
@@ -262,21 +267,37 @@ for IN in "${args[@]}"; do
 
   # Pass 1 — measure only
   PASS1_JSON="$(mktemp -t waxoff_pass1.XXXXXX.json 2>/dev/null || echo "/tmp/waxoff_pass1.$RANDOM.json")"
-  "$FFMPEG" -hide_banner -nostats -y -i "$IN"         -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:print_format=json"         -f null - 2> "$PASS1_JSON"
+  "$FFMPEG" -hide_banner -nostats -y -i "$IN" \
+    -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:print_format=json" \
+    -f null - 2> "$PASS1_JSON"
   P1_RC=$?
-  MEAS_I="$(extract_json_num "$PASS1_JSON" input_i)"; MEAS_TP="$(extract_json_num "$PASS1_JSON" input_tp)"; MEAS_LRA="$(extract_json_num "$PASS1_JSON" input_lra)"; MEAS_THRESH="$(extract_json_num "$PASS1_JSON" input_thresh)"; MEAS_OFFSET="$(extract_json_num "$PASS1_JSON" target_offset)"
+  MEAS_I="$(extract_json_num "$PASS1_JSON" input_i)"
+  MEAS_TP="$(extract_json_num "$PASS1_JSON" input_tp)"
+  MEAS_LRA="$(extract_json_num "$PASS1_JSON" input_lra)"
+  MEAS_THRESH="$(extract_json_num "$PASS1_JSON" input_thresh)"
+  MEAS_OFFSET="$(extract_json_num "$PASS1_JSON" target_offset)"
   rm -f "$PASS1_JSON" 2>/dev/null || true
   HAVE_MEAS=0; [[ $P1_RC -eq 0 && -n "${MEAS_I:-}" && -n "${MEAS_TP:-}" && -n "${MEAS_LRA:-}" && -n "${MEAS_THRESH:-}" && -n "${MEAS_OFFSET:-}" ]] && HAVE_MEAS=1
 
   DUR_RENDER="$(ffprobe_duration_s "$IN")"
 
   # WAV render with progress
-  if [ $HAVE_MEAS -eq 1 ]; then
-    if ! ffmpeg_with_progress "$DUR_RENDER" "render"           -y -i "$IN"           -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:measured_I=${MEAS_I}:measured_TP=${MEAS_TP}:measured_LRA=${MEAS_LRA}:measured_thresh=${MEAS_THRESH}:offset=${MEAS_OFFSET}:linear=true:print_format=summary"           -ar "$SAMPLE_RATE" -c:a pcm_s24le -f wav "$TMP_WAV"
-    then echo "!! WAV render FAILED for: $BASE"; FAILED=$((FAILED+1)); continue; fi
+  if [[ $HAVE_MEAS -eq 1 ]]; then
+    if ! ffmpeg_with_progress "$DUR_RENDER" "render" \
+         -y -i "$IN" \
+         -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:measured_I=${MEAS_I}:measured_TP=${MEAS_TP}:measured_LRA=${MEAS_LRA}:measured_thresh=${MEAS_THRESH}:offset=${MEAS_OFFSET}:linear=true:print_format=summary" \
+         -ar "$SAMPLE_RATE" -c:a pcm_s24le -f wav "$TMP_WAV"
+    then
+      echo "!! WAV render FAILED for: $BASE"; FAILED=$((FAILED+1)); continue
+    fi
   else
-    if ! ffmpeg_with_progress "$DUR_RENDER" "render"           -y -i "$IN"           -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:linear=true:print_format=summary"           -ar "$SAMPLE_RATE" -c:a pcm_s24le -f wav "$TMP_WAV"
-    then echo "!! WAV render FAILED for: $BASE"; FAILED=$((FAILED+1)); continue; fi
+    if ! ffmpeg_with_progress "$DUR_RENDER" "render" \
+         -y -i "$IN" \
+         -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:linear=true:print_format=summary" \
+         -ar "$SAMPLE_RATE" -c:a pcm_s24le -f wav "$TMP_WAV"
+    then
+      echo "!! WAV render FAILED for: $BASE"; FAILED=$((FAILED+1)); continue
+    fi
   fi
 
   want_wav=0; want_mp3=0; want_flac=0
@@ -285,16 +306,24 @@ for IN in "${args[@]}"; do
   [[ "$OUTMODE" == "flac" || "$OUTMODE" == "wav+flac" || "$OUTMODE" == "all" ]] && want_flac=1
 
   # Reveal WAV if requested
-  if [[ $want_wav -eq 1 ]]; then mv -f "$TMP_WAV" "$WAV_OUT"; for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_WAV" ]] && unset 'TEMP_FILES[i]'; done; fi
+  if [[ $want_wav -eq 1 ]]; then
+    mv -f "$TMP_WAV" "$WAV_OUT"
+    for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_WAV" ]] && unset 'TEMP_FILES[i]'; done
+  fi
 
   # MP3 encode with progress
   if [[ $want_mp3 -eq 1 ]]; then
     SRC_FOR_MP3="$TMP_WAV"; [[ -f "$WAV_OUT" ]] && SRC_FOR_MP3="$WAV_OUT"
     TEMP_FILES+=("$TMP_MP3")
     ENC_DUR="$(ffprobe_duration_s "${WAV_OUT:-$TMP_WAV}")"
-    if ffmpeg_with_progress "$ENC_DUR" "mp3"           -y -i "$SRC_FOR_MP3" -c:a "$MP3_CODEC" -b:a "$MP3_BITRATE" -ar "$SAMPLE_RATE" -ac 2 -f mp3 "$TMP_MP3"
-    then mv -f "$TMP_MP3" "$MP3_OUT"; for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_MP3" ]] && unset 'TEMP_FILES[i]'; done
-    else echo "!! MP3 encode FAILED for: $BASE"; FAILED=$((FAILED+1)); fi
+    if ffmpeg_with_progress "$ENC_DUR" "mp3" \
+         -y -i "$SRC_FOR_MP3" -c:a "$MP3_CODEC" -b:a "$MP3_BITRATE" -ar "$SAMPLE_RATE" -ac 2 -f mp3 "$TMP_MP3"
+    then
+      mv -f "$TMP_MP3" "$MP3_OUT"
+      for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_MP3" ]] && unset 'TEMP_FILES[i]'; done
+    else
+      echo "!! MP3 encode FAILED for: $BASE"; FAILED=$((FAILED+1))
+    fi
   fi
 
   # FLAC encode with progress
@@ -302,19 +331,35 @@ for IN in "${args[@]}"; do
     SRC_FOR_FLAC="$TMP_WAV"; [[ -f "$WAV_OUT" ]] && SRC_FOR_FLAC="$WAV_OUT"
     TEMP_FILES+=("$TMP_FLAC")
     ENC_DUR="$(ffprobe_duration_s "${WAV_OUT:-$TMP_WAV}")"
-    if ffmpeg_with_progress "$ENC_DUR" "flac"           -y -i "$SRC_FOR_FLAC" -c:a flac -compression_level "$FLAC_LEVEL" -ar "$SAMPLE_RATE" -f flac "$TMP_FLAC"
-    then mv -f "$TMP_FLAC" "$FLAC_OUT"; for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_FLAC" ]] && unset 'TEMP_FILES[i]'; done
-    else echo "!! FLAC encode FAILED for: $BASE"; FAILED=$((FAILED+1)); fi
+    if ffmpeg_with_progress "$ENC_DUR" "flac" \
+         -y -i "$SRC_FOR_FLAC" -c:a flac -compression_level "$FLAC_LEVEL" -ar "$SAMPLE_RATE" -f flac "$TMP_FLAC"
+    then
+      mv -f "$TMP_FLAC" "$FLAC_OUT"
+      for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_FLAC" ]] && unset 'TEMP_FILES[i]'; done
+    else
+      echo "!! FLAC encode FAILED for: $BASE"; FAILED=$((FAILED+1))
+    fi
   fi
 
   # Spot-check
   SC_TXT="$(mktemp -t waxoff_sc.XXXXXX.txt 2>/dev/null || echo "/tmp/waxoff_sc.$RANDOM.txt")"
-  if [[ -f "$WAV_OUT" ]]; then spotcheck_file "$WAV_OUT" "$SC_TXT"; else spotcheck_file "$TMP_WAV" "$SC_TXT"; fi
-  OUTS=(); [[ $want_wav -eq 1 ]] && OUTS+=("$(basename "$WAV_OUT")"); [[ $want_mp3 -eq 1 ]] && OUTS+=("$(basename "$MP3_OUT")"); [[ $want_flac -eq 1 ]] && OUTS+=("$(basename "$FLAC_OUT")")
-  echo "✓ ${BASE} → ${OUTS[*]}  $(cat "$SC_TXT" 2>/dev/null || echo "")"; rm -f "$SC_TXT" 2>/dev/null || true
+  if [[ -f "$WAV_OUT" ]]; then
+    spotcheck_file "$WAV_OUT" "$SC_TXT"
+  else
+    spotcheck_file "$TMP_WAV" "$SC_TXT"
+  fi
+  OUTS=()
+  [[ $want_wav -eq 1 ]]  && OUTS+=("$(basename "$WAV_OUT")")
+  [[ $want_mp3 -eq 1 ]] && OUTS+=("$(basename "$MP3_OUT")")
+  [[ $want_flac -eq 1 ]] && OUTS+=("$(basename "$FLAC_OUT")")
+  echo "✓ ${BASE} → ${OUTS[*]}  $(cat "$SC_TXT" 2>/dev/null || echo "")"
+  rm -f "$SC_TXT" 2>/dev/null || true
 
   # If mp3/flac only, remove hidden WAV temp
-  if [[ $want_wav -eq 0 && -f "$TMP_WAV" ]]; then rm -f "$TMP_WAV"; for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_WAV" ]] && unset 'TEMP_FILES[i]'; done; fi
+  if [[ $want_wav -eq 0 && -f "$TMP_WAV" ]]; then
+    rm -f "$TMP_WAV"
+    for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_WAV" ]] && unset 'TEMP_FILES[i]'; done
+  fi
 
   OKC=$((OKC+1))
 done
