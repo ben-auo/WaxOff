@@ -40,6 +40,15 @@ waxoff *.wav
 #   • Sample rate (44100 or 48000)
 ```
 
+### Example
+
+```bash
+waxoff ~/Mixdowns/episode_mix.wav
+# → Outputs episode_mix-lev-18LUFS.wav and episode_mix-lev-18LUFS.mp3
+```
+
+---
+
 ## Non-interactive usage (flags / env)
 
 ```bash
@@ -61,6 +70,20 @@ PROMPT=0 TARGET_I=-18 OUTMODE=all SAMPLE_RATE=48000 waxoff *.wav
   --no-prompt              Skip interactive questions
   -q, --quiet              Reduce console output
   -n, --dry-run            Show actions without writing files
+```
+
+---
+
+## Updating
+
+To pull the latest version (dev install only):
+```bash
+cd ~/src/WaxOff && git pull && ./install.sh --dev
+```
+
+To reinstall the general version:
+```bash
+bash -c 'd=$(mktemp -d); git clone --depth=1 https://github.com/sevmorris/WaxOff "$d" && (cd "$d" && ./install.sh) && rm -rf "$d"'
 ```
 
 ---
