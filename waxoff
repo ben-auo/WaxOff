@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # WaxOff — Final Mix Loudness Leveler (transparent; no dynamics processing)
-# Two-pass EBU R128 loudness normalization with true-peak safety at -1 dBTP.
+# Two-pass EBU R128 normalization with true-peak safety at -1 dBTP.
 # Outputs: WAV / MP3 (CBR) / FLAC; 44.1 or 48 kHz; atomic writes; interactive or flags.
 
 set -u
@@ -35,6 +35,7 @@ log "ENV: PROMPT=$PROMPT TARGET_I=$TARGET_I OUTMODE=$OUTMODE MP3_BITRATE=$MP3_BI
 command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version | head -n 1 >>"$LOG" 2>&1
 
 # -------------------- Atomic write with format awareness --------------------
+# atomic_write <final_path> <fmt> -- <ffmpeg args up to before output file>
 atomic_write() {
   local final="$1"; shift
   local fmt="$1"; shift
@@ -44,7 +45,8 @@ atomic_write() {
   tmp="${dir}/.${stem}.tmp.$$.$ext"
   [[ "${DRY_RUN}" = "1" ]] && { say "[DRY] ffmpeg ($fmt) -> ${final}"; return 0; }
   mkdir -p "$dir" 2>/dev/null || true
-  ffmpeg -hide_banner -nostdin -y -f "$fmt" "$@" "$tmp" >>"$LOG" 2>&1
+  # Place -f *before output* so it doesn't affect input demuxer
+  ffmpeg -hide_banner -nostdin -y "$@" -f "$fmt" "$tmp" >>"$LOG" 2>&1
   local rc=$?
   if [[ $rc -ne 0 ]]; then
     rm -f "$tmp"
@@ -202,7 +204,6 @@ if [[ "${PROMPT}" = "1" ]]; then interactive_prompts; fi
 analyze_file() {
   local in="$1"
   local I_m TP_m LRA_m TH_m OF_m
-  # Pass 1: JSON first
   local p1
   p1="$(ffmpeg -hide_banner -nostats -nostdin -y -i "$in" \
     -filter_complex "[0:a]loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=11:print_format=json" \
@@ -211,7 +212,6 @@ analyze_file() {
     printf '%s\n' "$I_m $TP_m $LRA_m $TH_m $OF_m"
     return 0
   fi
-  # Summary fallback
   local p1s
   p1s="$(ffmpeg -hide_banner -nostats -nostdin -y -i "$in" \
     -filter_complex "[0:a]loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=11:print_format=summary" \
@@ -225,16 +225,13 @@ analyze_file() {
 
 # -------------------- Rendering helpers --------------------
 render_with_fallbacks() {
-  # $1 final_path, $2 fmt, $3 filterchain, $4... ffmpeg extra codec args
   local final="$1"; shift
   local fmt="$1"; shift
   local chain="$1"; shift
 
-  # Try with soxr
   if atomic_write "$final" "$fmt" -- -i "$INFILE" -map 0:a:0 -vn -filter:a "${chain},aresample=${SAMPLE_RATE}:resampler=soxr" "$@" -ar "${SAMPLE_RATE}" -dn -nostdin; then
     return 0
   fi
-  # Retry without specifying resampler (uses default)
   if atomic_write "$final" "$fmt" -- -i "$INFILE" -map 0:a:0 -vn -filter:a "${chain},aresample=${SAMPLE_RATE}" "$@" -ar "${SAMPLE_RATE}" -dn -nostdin; then
     warn "Resampler fallback succeeded for: ${final}"
     return 0
@@ -266,7 +263,6 @@ for INFILE in "$@"; do
   OUT_MP3="${DIR}/${STEM}-lvl${TARGET_I}LUFS.mp3"
   OUT_FLAC="${DIR}/${STEM}-lvl${TARGET_I}LUFS.flac"
 
-  # Render plan
   want_wav=0; want_mp3=0; want_flac=0
   case "$OUTMODE" in
     wav) want_wav=1 ;;
@@ -302,11 +298,9 @@ for INFILE in "$@"; do
   if [[ $want_flac -eq 1 ]]; then
     out_need=$((out_need+1))
     say "Render FLAC: ${OUT_FLAC} (level ${FLAC_LEVEL}) @ ${SAMPLE_RATE} Hz"
-    # First attempt with requested compression level
     if render_with_fallbacks "$OUT_FLAC" flac "$LOUD2" -c:a flac -compression_level "${FLAC_LEVEL}"; then
       out_ok=$((out_ok+1))
     else
-      # Fallback: try default compression level (omit flag)
       warn "FLAC retry with default compression: ${OUT_FLAC}"
       if render_with_fallbacks "$OUT_FLAC" flac "$LOUD2" -c:a flac; then
         out_ok=$((out_ok+1))
