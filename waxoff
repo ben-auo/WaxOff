@@ -1,17 +1,11 @@
 #!/usr/bin/env bash
 # WaxOff — Final Mix Loudness Leveler (transparent; no dynamics processing)
-# Two-pass EBU R128 normalization with true-peak safety at -1 dBTP.
+# Two-pass EBU R128 loudness normalization with true-peak safety at -1 dBTP.
 # Outputs: WAV / MP3 (CBR) / FLAC; 44.1 or 48 kHz; atomic writes; interactive or flags.
-#
-# Improvements in this build:
-# - Robust loudnorm pass-1 parsing: JSON first, then SUMMARY text fallback.
-# - Encoder/resampler fallbacks: if flac/soxr fails, retry sanely.
-# - Clear per-output status (WAV/MP3/FLAC) and accurate exit code.
-# - Prompts on /dev/tty; logs to ~/Library/Logs/waxoff_cli.log.
 
 set -u
 IFS=$'\n\t'
-PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH}"; export PATH
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH}"
 
 PROMPT="${PROMPT:-1}"                 # 1=interactive menus, 0=flags/env only
 TARGET_I="${TARGET_I:--18}"           # -18 or -16
@@ -38,7 +32,7 @@ log ""
 log "======== $(date '+%Y-%m-%d %H:%M:%S') — WaxOff start ========"
 log "Args: $*"
 log "ENV: PROMPT=$PROMPT TARGET_I=$TARGET_I OUTMODE=$OUTMODE MP3_BITRATE=$MP3_BITRATE FLAC_LEVEL=$FLAC_LEVEL SAMPLE_RATE=$SAMPLE_RATE QUIET=$QUIET DRY_RUN=$DRY_RUN"
-if command -v ffmpeg >/dev/null 2>&1; then ffmpeg -version | head -n 1 >>"$LOG" 2>&1; fi
+command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version | head -n 1 >>"$LOG" 2>&1
 
 # -------------------- Atomic write with format awareness --------------------
 atomic_write() {
@@ -204,7 +198,7 @@ test "$FLAC_LEVEL" -ge 0 -a "$FLAC_LEVEL" -le 12 || die "FLAC_LEVEL must be 0..1
 
 if [[ "${PROMPT}" = "1" ]]; then interactive_prompts; fi
 
-# -------------------- Core processing --------------------
+# -------------------- Analysis --------------------
 analyze_file() {
   local in="$1"
   local I_m TP_m LRA_m TH_m OF_m
@@ -229,12 +223,12 @@ analyze_file() {
   return 1
 }
 
+# -------------------- Rendering helpers --------------------
 render_with_fallbacks() {
   # $1 final_path, $2 fmt, $3 filterchain, $4... ffmpeg extra codec args
   local final="$1"; shift
   local fmt="$1"; shift
   local chain="$1"; shift
-  local rc=0
 
   # Try with soxr
   if atomic_write "$final" "$fmt" -- -i "$INFILE" -map 0:a:0 -vn -filter:a "${chain},aresample=${SAMPLE_RATE}:resampler=soxr" "$@" -ar "${SAMPLE_RATE}" -dn -nostdin; then
@@ -248,6 +242,7 @@ render_with_fallbacks() {
   return 1
 }
 
+# -------------------- Main loop --------------------
 ok=0; fail=0
 
 for INFILE in "$@"; do
