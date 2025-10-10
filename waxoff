@@ -3,9 +3,10 @@
 # Two-pass EBU R128 loudness normalization with true-peak safety at -1 dBTP.
 # Outputs: WAV / MP3 (CBR) / FLAC; 44.1 or 48 kHz; atomic writes; interactive or flags.
 #
-# Philosophy: set final loudness only (global gain + TP ceiling). No EQ/comp/gate.
-# This version fixes: prompts/logging not visible due to redirected stdout.
-# All user-facing prompts go to /dev/tty; logs go to ~/Library/Logs/waxoff_cli.log.
+# Fixes:
+# - Ensures ffmpeg knows the output format for temp files (preserves extension and/or -f <fmt>).
+# - Properly propagates atomic_write failures to overall status.
+# - Prompts sent to /dev/tty; logging to ~/Library/Logs/waxoff_cli.log.
 
 set -u
 IFS=$'\n\t'
@@ -41,16 +42,27 @@ log "Args: $*"
 log "ENV: PROMPT=$PROMPT TARGET_I=$TARGET_I OUTMODE=$OUTMODE MP3_BITRATE=$MP3_BITRATE FLAC_LEVEL=$FLAC_LEVEL SAMPLE_RATE=$SAMPLE_RATE QUIET=$QUIET DRY_RUN=$DRY_RUN"
 if command -v ffmpeg >/dev/null 2>&1; then ffmpeg -version | head -n 1 >>"$LOG" 2>&1; fi
 
-# Atomic write: write to a hidden temp in same dir, then mv over
+# -------------------- Atomic write with format awareness --------------------
+# Usage: atomic_write <final_path> <fmt> -- <ffmpeg args before output>
+#  - <fmt> is one of: wav|mp3|flac (helps ffmpeg choose correct muxer for temp)
+#  - temp file keeps the correct extension at the end, e.g. ".basename.tmp.$$.<ext>"
 atomic_write() {
   local final="$1"; shift
-  local dir base tmp
+  local fmt="$1"; shift
+  [[ "$1" == "--" ]] && shift || true
+
+  local dir base stem ext tmp
   dir="$(dirname "$final")"
   base="$(basename "$final")"
-  tmp="${dir}/.${base}.tmp.$$"
-  [[ "${DRY_RUN}" = "1" ]] && { say "[DRY] ffmpeg -> ${final}"; return 0; }
+  ext="${final##*.}"
+  stem="${base%.*}"
+  tmp="${dir}/.${stem}.tmp.$$.$ext"   # preserve extension at end
+
+  [[ "${DRY_RUN}" = "1" ]] && { say "[DRY] ffmpeg ($fmt) -> ${final}"; return 0; }
   mkdir -p "$dir" 2>/dev/null || true
-  ffmpeg -hide_banner -nostdin -y "$@" "$tmp" >>"$LOG" 2>&1
+
+  # Let ffmpeg know the container explicitly, and write to tmp
+  ffmpeg -hide_banner -nostdin -y -f "$fmt" "$@" "$tmp" >>"$LOG" 2>&1
   local rc=$?
   if [[ $rc -ne 0 ]]; then
     err "ffmpeg render failed (rc=$rc) for $final (see log)"
@@ -61,7 +73,7 @@ atomic_write() {
   return 0
 }
 
-# Parse JSON loudnorm (no jq)
+# -------------------- Parse JSON loudnorm (no jq) --------------------
 parse_json_loudnorm() {
   awk '
     BEGIN{ I=TP=LRA=TH=OF="" }
@@ -77,9 +89,7 @@ parse_json_loudnorm() {
 }
 
 prompt_read() {
-  # $1 message, sets global REPLY
   printf '%s' "$1" >"$TTY_DEV"
-  # Read from TTY explicitly so pipes don’t block
   IFS= read -r REPLY <"$TTY_DEV"
 }
 
@@ -243,45 +253,56 @@ process_file() {
     loud2="loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=11:linear=true:print_format=summary"
   fi
 
+  local rc=0
+
   # WAV
   if [[ "$OUTMODE" == "wav" || "$OUTMODE" == "both" || "$OUTMODE" == "wav+flac" || "$OUTMODE" == "all" ]]; then
     say "Render WAV: ${out_wav} @ ${SAMPLE_RATE} Hz"
-    atomic_write "$out_wav" \
+    atomic_write "$out_wav" wav -- \
       -i "$in" -map 0:a:0 -vn \
       -filter:a "${loud2},aresample=${SAMPLE_RATE}:resampler=soxr" \
       -c:a pcm_s24le -ar "${SAMPLE_RATE}" \
-      -dn -nostdin
+      -dn -nostdin || rc=$?
   fi
 
   # MP3
   if [[ "$OUTMODE" == "mp3" || "$OUTMODE" == "both" || "$OUTMODE" == "all" ]]; then
     say "Render MP3: ${out_mp3} (${MP3_BITRATE}) @ ${SAMPLE_RATE} Hz"
-    atomic_write "$out_mp3" \
+    atomic_write "$out_mp3" mp3 -- \
       -i "$in" -map 0:a:0 -vn \
       -filter:a "${loud2},aresample=${SAMPLE_RATE}:resampler=soxr" \
       -c:a libmp3lame -b:a "${MP3_BITRATE}" -ar "${SAMPLE_RATE}" \
-      -dn -nostdin
+      -dn -nostdin || rc=$?
   fi
 
   # FLAC
   if [[ "$OUTMODE" == "flac" || "$OUTMODE" == "wav+flac" || "$OUTMODE" == "all" ]]; then
     say "Render FLAC: ${out_flac} (level ${FLAC_LEVEL}) @ ${SAMPLE_RATE} Hz"
-    atomic_write "$out_flac" \
+    atomic_write "$out_flac" flac -- \
       -i "$in" -map 0:a:0 -vn \
       -filter:a "${loud2},aresample=${SAMPLE_RATE}:resampler=soxr" \
       -c:a flac -compression_level "${FLAC_LEVEL}" -ar "${SAMPLE_RATE}" \
-      -dn -nostdin
+      -dn -nostdin || rc=$?
   fi
 
-  say "OK: $in"
-  return 0
+  if [[ $rc -eq 0 ]]; then
+    say "OK: $in"
+    return 0
+  else
+    err "FAILED: $in"
+    return $rc
+  fi
 }
 
 ok=0
 fail=0
 
 for f in "$@"; do
-  process_file "$f" && ok=$((ok+1)) || fail=$((fail+1))
+  if process_file "$f"; then
+    ok=$((ok+1))
+  else
+    fail=$((fail+1))
+  fi
 done
 
 printf 'Result: files OK=%d, failed=%d\n' "$ok" "$fail" >"$TTY_DEV"
