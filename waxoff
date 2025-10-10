@@ -1,369 +1,327 @@
 #!/usr/bin/env bash
-# WaxOff — Interactive CLI Stereo Podcast Leveler (WAV/MP3/FLAC)
-# VERSION v1.3 — with progress and macOS file picker
+# WaxOff — Final Mix Loudness Leveler (No Dynamics Processing)
+# Transparent two-pass EBU R128 normalization with true-peak safety at -1 dBTP
+# Outputs: WAV / MP3 (CBR) / FLAC; 44.1 or 48 kHz; atomic writes; interactive or flags
+#
+# Philosophy: set final loudness only (global gain + TP ceiling). No compression, EQ, gating, etc.
 
+# -------------------- Shell & PATH --------------------
 set -u
-set +e
 IFS=$'\n\t'
+PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH}"; export PATH
 
-VERSION="${VERSION:-v1.3}"
-APP_TITLE="WaxOff ${VERSION} — Interactive CLI Leveler"
+# -------------------- Defaults (can be overridden) --------------------
+PROMPT="${PROMPT:-1}"                 # 1=interactive menus, 0=flags/env only
+TARGET_I="${TARGET_I:-"-18"}"         # "-18" or "-16"
+TARGET_TP="${TARGET_TP:--1.0}"        # true-peak safety
+OUTMODE="${OUTMODE:-both}"            # wav | mp3 | both | flac | wav+flac | all
+MP3_BITRATE="${MP3_BITRATE:-160k}"    # 128k | 160k | 192k
+FLAC_LEVEL="${FLAC_LEVEL:-8}"         # 0..12
+SAMPLE_RATE="${SAMPLE_RATE:-44100}"   # 44100 | 48000
+LOG="${LOG:-${HOME}/Library/Logs/waxoff_cli.log}"
+QUIET="${QUIET:-0}"                   # 1 reduces chatter
+DRY_RUN="${DRY_RUN:-0}"               # 1 = plan only
 
-PROMPT="${PROMPT:-1}"
-TARGET_I="${TARGET_I:--18}"
-TARGET_TP="${TARGET_TP:--1.0}"
-TARGET_LRA="${TARGET_LRA:-11}"
-OUTMODE="${OUTMODE:-both}"      # wav | mp3 | both | flac | wav+flac | all
-MP3_BITRATE="${MP3_BITRATE:-160k}"
-MP3_CODEC="${MP3_CODEC:-libmp3lame}"
-SAMPLE_RATE="${SAMPLE_RATE:-44100}"
-FLAC_LEVEL="${FLAC_LEVEL:-8}"
-LOG_FILE="${LOG_FILE:-${HOME}/Library/Logs/waxoff_cli.log}"
+mkdir -p "$(dirname "$LOG")"
+exec >>"$LOG" 2>&1
+echo ""
+echo "======== $(date '+%Y-%m-%d %H:%M:%S') — WaxOff start ========"
+echo "Args: $*"
+echo "ENV: PROMPT=$PROMPT TARGET_I=$TARGET_I OUTMODE=$OUTMODE MP3_BITRATE=$MP3_BITRATE FLAC_LEVEL=$FLAC_LEVEL SAMPLE_RATE=$SAMPLE_RATE QUIET=$QUIET DRY_RUN=$DRY_RUN"
+command -v ffmpeg && ffmpeg -version | head -n 1
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-FFMPEG="${FFMPEG:-$(command -v /opt/homebrew/bin/ffmpeg || command -v ffmpeg || true)}"
+# -------------------- Helpers --------------------
+say() { [[ "${QUIET}" = "1" ]] && return 0; printf '%s\n' "$*"; }
+err() { printf 'Error: %s\n' "$*" 1>&2; }
+die() { err "$*"; exit 1; }
 
-usage() { cat <<EOF
-${APP_TITLE}
+need() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
-Usage: waxoff [options] <file>...
+# Atomic write: write to a hidden temp in same dir, then mv over
+atomic_write() {
+  # $1 = final_path ; $2.. = ffmpeg args for encoding to that path
+  local final="$1"; shift
+  local dir base ext tmp
+  dir="$(dirname "$final")"
+  base="$(basename "$final")"
+  ext="${base##*.}"
+  tmp="${dir}/.${base}.tmp.$$"   # hidden temp
+  [[ "${DRY_RUN}" = "1" ]] && { say "[DRY] ffmpeg -> ${final}"; return 0; }
 
-Options:
-  -t, --target <LUFS>      -18 (default) or -16
-  -m, --mode <mode>        wav | mp3 | both | flac | wav+flac | all   (default: both)
-  -b, --bitrate <rate>     128k | 160k (default) | 192k  (for MP3)
-  -s, --samplerate <hz>    44100 (default) or 48000
-  --flac-level <N>         0..12 compression (default: 8)
-  -l, --log <path>         Log file path
-  --no-prompt              Run without interactive questions
-  -q, --quiet              Less verbose console output
-  -n, --dry-run            Show what would happen; no outputs written
-  -h, --help               Show this help and exit
-EOF
+  mkdir -p "$dir"
+  # write to tmp
+  ffmpeg -hide_banner -y "$@" "$tmp"
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    err "ffmpeg render failed (rc=$rc) for $final"
+    rm -f "$tmp"
+    return $rc
+  fi
+
+  # finalize
+  mv -f "$tmp" "$final"
+  return 0
 }
 
-QUIET=0; DRYRUN=0; args=()
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    -t|--target)      TARGET_I="$2"; shift 2 ;;
-    -m|--mode)        OUTMODE="$2"; shift 2 ;;
-    -b|--bitrate)     MP3_BITRATE="$2"; shift 2 ;;
-    -s|--samplerate)  SAMPLE_RATE="$2"; shift 2 ;;
-    --flac-level)     FLAC_LEVEL="$2"; shift 2 ;;
-    -l|--log)         LOG_FILE="$2"; shift 2 ;;
-    --no-prompt)      PROMPT="0"; shift ;;
-    -q|--quiet)       QUIET=1; shift ;;
-    -n|--dry-run)     DRYRUN=1; shift ;;
-    -h|--help)        usage; exit 0 ;;
-    --)               shift; break ;;
-    -*) echo "Unknown option: $1" >&2; usage; exit 2 ;;
-    *) args+=("$1"); shift ;;
+# Parse EBU R128 measurements from first pass
+parse_loudnorm_summary() {
+  # reads stdin, echos 6 fields: I TP LRA thresh offset
+  # We accept both JSON-ish and summary formats
+  awk '
+    /I:|Input Integrated/     { val=$NF; gsub(/[^0-9\.\-\+]/,"",val); I=val }
+    /TP:|Input True Peak/     { val=$NF; gsub(/[^0-9\.\-\+]/,"",val); TP=val }
+    /LRA:|Input LRA/          { val=$NF; gsub(/[^0-9\.\-\+]/,"",val); LRA=val }
+    /Threshold:|Input Threshold/ { val=$NF; gsub(/[^0-9\.\-\+]/,"",val); TH=val }
+    /Offset:/                  { val=$NF; gsub(/[^0-9\.\-\+]/,"",val); OF=val }
+    END {
+      if (I=="" || TP=="" || LRA=="" || TH=="" || OF=="") exit 1;
+      print I, TP, LRA, TH, OF
+    }
+  '
+}
+
+# -------------------- Interactive prompts --------------------
+interactive_prompts() {
+  # Target
+  printf '%s\n' "Select loudness target (TP = −1.0 dBTP):
+  1) −18 LUFS (recommended)
+  2) −16 LUFS"
+  read -r -p "Enter 1-2 (default 1): " ans
+  case "${ans:-1}" in
+    1) TARGET_I="-18" ;;
+    2) TARGET_I="-16" ;;
+    *) TARGET_I="-18" ;;
   esac
-done
-[[ $# -gt 0 ]] && args+=("$@")
 
-is_int() { [[ "$1" =~ ^-?[0-9]+$ ]]; }
-is_choice() { local v="$1"; shift; for c in "$@"; do [[ "$v" == "$c" ]] && return 0; done; return 1; }
-
-# ---- macOS file picker (only when interactive & no args) ----
-pick_files_macos() {
-  /usr/bin/osascript <<'OSA' 2>/dev/null
-set fp to choose file with prompt "Select one or more audio files for WaxOff:" with multiple selections allowed
-set out to ""
-repeat with f in fp
-  set out to out & POSIX path of f & "\n"
-end repeat
-return out
-OSA
-}
-
-prompt_target() {
-  echo "Select loudness target (TP = −1.0 dBTP):"
-  echo "  1) −18 LUFS (recommended)"
-  echo "  2) −16 LUFS"
-  read -r -p "Enter 1-2 (default 1): " a
-  case "${a:-1}" in 1) TARGET_I="-18" ;; 2) TARGET_I="-16" ;; *) TARGET_I="-18" ;; esac
-}
-prompt_mode() {
-  echo "Choose output mode:"
-  echo "  1) wav"
-  echo "  2) mp3"
-  echo "  3) both (wav+mp3)"
-  echo "  4) flac"
-  echo "  5) wav+flac"
-  echo "  6) all (wav+mp3+flac)"
-  read -r -p "Enter 1-6 (default 3): " a
-  case "${a:-3}" in
-    1) OUTMODE="wav" ;; 2) OUTMODE="mp3" ;; 3) OUTMODE="both" ;;
-    4) OUTMODE="flac" ;; 5) OUTMODE="wav+flac" ;; 6) OUTMODE="all" ;;
+  # Mode
+  printf '%s\n' "Choose output mode:
+  1) wav
+  2) mp3
+  3) both (wav+mp3)
+  4) flac
+  5) wav+flac
+  6) all (wav+mp3+flac)"
+  read -r -p "Enter 1-6 (default 3): " ans
+  case "${ans:-3}" in
+    1) OUTMODE="wav" ;;
+    2) OUTMODE="mp3" ;;
+    3) OUTMODE="both" ;;
+    4) OUTMODE="flac" ;;
+    5) OUTMODE="wav+flac" ;;
+    6) OUTMODE="all" ;;
     *) OUTMODE="both" ;;
   esac
-}
-prompt_mp3() {
-  case "$OUTMODE" in mp3|both|all)
-    echo "MP3 bitrate:"
-    echo "  1) 128k"
-    echo "  2) 160k (recommended)"
-    echo "  3) 192k"
-    read -r -p "Enter 1-3 (default 2): " a
-    case "${a:-2}" in 1) MP3_BITRATE="128k" ;; 2) MP3_BITRATE="160k" ;; 3) MP3_BITRATE="192k" ;; *) MP3_BITRATE="160k" ;; esac
+
+  # MP3 bitrate if relevant
+  if [[ "${OUTMODE}" == "mp3" || "${OUTMODE}" == "both" || "${OUTMODE}" == "all" ]]; then
+    printf '%s\n' "MP3 bitrate:
+    1) 128k
+    2) 160k (recommended)
+    3) 192k"
+    read -r -p "Enter 1-3 (default 2): " ans
+    case "${ans:-2}" in
+      1) MP3_BITRATE="128k" ;;
+      2) MP3_BITRATE="160k" ;;
+      3) MP3_BITRATE="192k" ;;
+      *) MP3_BITRATE="160k" ;;
+    esac
+  fi
+
+  # Sample rate
+  printf '%s\n' "Sample rate:
+  1) 44100 Hz (default)
+  2) 48000 Hz"
+  read -r -p "Enter 1-2 (default 1): " ans
+  case "${ans:-1}" in
+    1) SAMPLE_RATE="44100" ;;
+    2) SAMPLE_RATE="48000" ;;
+    *) SAMPLE_RATE="44100" ;;
   esac
-}
-prompt_flac() {
-  case "$OUTMODE" in flac|wav+flac|all)
-    read -r -p "FLAC compression level 0..12 (default 8): " a
-    if is_int "${a:-8}" && (( ${a:-8} >= 0 && ${a:-8} <= 12 )); then FLAC_LEVEL="${a:-8}"; else FLAC_LEVEL="8"; fi
-  esac
-}
-prompt_sr() {
-  echo "Sample rate:"
-  echo "  1) 44100 Hz (default)"
-  echo "  2) 48000 Hz"
-  read -r -p "Enter 1-2 (default 1): " a
-  case "${a:-1}" in 1) SAMPLE_RATE="44100" ;; 2) SAMPLE_RATE="48000" ;; *) SAMPLE_RATE="44100" ;; esac
-}
-confirm() {
-  echo
+
+  echo ""
   echo "Selections:"
-  echo "  Target:  ${TARGET_I} LUFS (TP −1 dBTP)"
-  echo "  Mode:    ${OUTMODE}"
-  [[ "$OUTMODE" =~ ^(mp3|both|all)$ ]] && echo "  MP3:     ${MP3_BITRATE}"
-  [[ "$OUTMODE" =~ ^(flac|wav\+flac|all)$ ]] && echo "  FLAC:    level ${FLAC_LEVEL}"
-  echo "  Sample:  ${SAMPLE_RATE} Hz"
-  read -r -p "Proceed? [Y/n]: " yn; case "${yn:-Y}" in Y|y) : ;; *) echo "Cancelled."; exit 0 ;; esac
+  printf "  Target:  %3s LUFS (TP −1 dBTP)\n" "${TARGET_I}"
+  printf "  Mode:    %s\n" "${OUTMODE}"
+  if [[ "${OUTMODE}" == "mp3" || "${OUTMODE}" == "both" || "${OUTMODE}" == "all" ]]; then
+    printf "  MP3:     %s\n" "${MP3_BITRATE}"
+  fi
+  printf "  Sample:  %s Hz\n" "${SAMPLE_RATE}"
+
+  read -r -p "Proceed? [Y/n]: " go
+  case "${go:-Y}" in
+    Y|y|"") : ;;
+    *) echo "Aborted."; exit 1 ;;
+  esac
 }
 
-# Offer picker if no args
-if [[ ${#args[@]} -lt 1 && "${PROMPT}" == "1" ]]; then
-  picks="$(pick_files_macos || true)"
-  if [[ -n "${picks:-}" ]]; then
-    while IFS= read -r line; do
-      [[ -n "$line" ]] && args+=("$line")
-    done <<< "$picks"
-  fi
-fi
+# -------------------- CLI flags (optional) --------------------
+# Simple manual parsing to avoid bashisms across shells
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-prompt) PROMPT=0; shift ;;
+    -t|--target) TARGET_I="$2"; shift 2 ;;
+    -m|--mode) OUTMODE="$2"; shift 2 ;;
+    -b|--bitrate) MP3_BITRATE="$2"; shift 2 ;;
+    -s|--samplerate) SAMPLE_RATE="$2"; shift 2 ;;
+    --flac-level) FLAC_LEVEL="$2"; shift 2 ;;
+    -l|--log) LOG="$2"; shift 2 ;;
+    -q|--quiet) QUIET=1; shift ;;
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    -h|--help)
+      cat <<'HLP'
+WaxOff — Final Mix Loudness Leveler
+Usage: waxoff [options] <files...>
 
-if [[ "${PROMPT}" == "1" ]]; then
-  prompt_target; prompt_mode; prompt_mp3; prompt_flac; prompt_sr; confirm
-fi
+Options:
+  --no-prompt             Non-interactive (use flags/env)
+  -t, --target <LUFS>     -18 (default) | -16
+  -m, --mode <mode>       wav | mp3 | both | flac | wav+flac | all   (default: both)
+  -b, --bitrate <rate>    128k | 160k | 192k (MP3; default 160k)
+  -s, --samplerate <hz>   44100 | 48000 (default 44100)
+      --flac-level <N>    0..12 (default 8)
+  -l, --log <path>        Log file path (default ~/Library/Logs/waxoff_cli.log)
+  -q, --quiet             Reduce console output
+  -n, --dry-run           Show plan only; no writes
+  -h, --help              Show this help
 
-if [[ ${#args[@]} -lt 1 ]]; then echo "No input files."; exit 2; fi
-if ! is_choice "$TARGET_I" "-18" "-16"; then echo "Invalid target: $TARGET_I"; exit 2; fi
-if ! is_choice "$OUTMODE" "wav" "mp3" "both" "flac" "wav+flac" "all"; then echo "Invalid mode: $OUTMODE"; exit 2; fi
-case "$MP3_BITRATE" in 128k|160k|192k) ;; *) echo "Invalid MP3 bitrate"; exit 2 ;; esac
-case "$SAMPLE_RATE" in 44100|48000) ;; *) echo "Invalid samplerate"; exit 2 ;; esac
-if ! is_int "$FLAC_LEVEL" || (( FLAC_LEVEL < 0 || FLAC_LEVEL > 12 )); then echo "Invalid flac level"; exit 2; fi
-
-if [[ -z "${FFMPEG:-}" || ! -x "$FFMPEG" ]]; then
-  echo "FFmpeg not found. Install with: brew install ffmpeg" >&2
-  exit 2
-}
-
-# ---- Logging (tee to console + file) ----
-mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
-exec > >(tee -a "$LOG_FILE") 2>&1
-echo "======== $(date '+%Y-%m-%d %H:%M:%S') — Run start ========"
-echo "Script: ${APP_TITLE}"
-echo "PATH=$PATH"
-echo "Args: ${args[*]}"
-$FFMPEG -version 2>/dev/null | head -n1 || true
-echo "Selections: target=${TARGET_I} LUFS | mode=${OUTMODE} | mp3=${MP3_BITRATE} | flac_level=${FLAC_LEVEL} | sr=${SAMPLE_RATE}"
-
-# ---- Helpers ----
-hidden_tmp() { local dir="$1" base="$2" ext="$3"; echo "${dir}/.${base}.part.$$.$RANDOM.${ext}"; }
-extract_json_num() { local f="$1" key="$2"; LC_ALL=C sed -nE "s/.*\"${key}\"[[:space:]]*:[[:space:]]*([-+]?([0-9]*\.)?[0-9]+).*/\1/p" "$f" | head -n1; }
-spotcheck_file() {
-  local F="$1" OUT="$2" J
-  J="$(mktemp -t waxoff_sc.XXXXXX.json 2>/dev/null || echo "/tmp/waxoff_sc.$RANDOM.json")"
-  "$FFMPEG" -hide_banner -nostats -y -i "$F" \
-    -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:print_format=json" \
-    -f null - 2> "$J"
-  if [[ $? -ne 0 ]]; then
-    echo "I=n/a TP=n/a" > "$OUT"
-  else
-    local fi tp
-    fi="$(extract_json_num "$J" input_i)"
-    tp="$(extract_json_num "$J" input_tp)"
-    echo "I=${fi:-n/a} TP=${tp:-n/a}" > "$OUT"
-  fi
-  rm -f "$J" 2>/dev/null || true
-}
-
-# ---- Progress helpers ----
-TTY_OUT="/dev/tty"; [ -w "$TTY_OUT" ] || TTY_OUT="/dev/null"
-progress_draw() {  # $1=label  $2=pct (0..100)
-  local label="$1" pct="$2" width=28 fill pad
-  (( pct < 0 )) && pct=0; (( pct > 100 )) && pct=100
-  fill=$(( (pct*width)/100 ))
-  pad=$(( width - fill ))
-  printf "\r%-12s [" "$label" >"$TTY_OUT"
-  printf "%${fill}s" "" | tr ' ' '#' >"$TTY_OUT"
-  printf "%${pad}s" ""  >"$TTY_OUT"
-  printf "] %3d%%" "$pct" >"$TTY_OUT"
-}
-ffprobe_duration_s() {
-  if ! command -v ffprobe >/dev/null 2>&1; then echo 0; return; fi
-  local dur
-  dur="$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$1" 2>/dev/null | head -n1)"
-  [ -n "$dur" ] && echo "$dur" || echo 0
-}
-ffmpeg_with_progress() {
-  local dur_s="$1" label="$2"; shift 2
-  local pipe; pipe="$(mktemp -u)"; mkfifo "$pipe"
-  (
-    local total_us cur_us pct k v
-    total_us=$(awk -v d="$dur_s" 'BEGIN{printf "%.0f", d*1000000}'); [ -z "$total_us" ] && total_us=1
-    while IFS='=' read -r k v; do
-      case "$k" in
-        out_time_us) cur_us="${v%.*}";;
-        out_time_ms) cur_us=$(( ${v%.*} * 1000 ));;
-        progress) [ "$v" = "end" ] && break; continue;;
-        *) continue;;
-      esac
-      [ -z "$cur_us" ] && cur_us=0
-      pct=$(( cur_us * 100 / (total_us>0?total_us:1) ))
-      (( pct>100 )) && pct=100
-      progress_draw "$label" "$pct"
-    done <"$pipe"
-    progress_draw "$label" 100; printf "\n" >"$TTY_OUT"
-  ) &
-  local reader_pid=$!
-  "$FFMPEG" -nostdin -hide_banner -loglevel error -stats_period 0.5 -progress "$pipe" "$@" 2>/dev/null
-  local rc=$?
-  kill "$reader_pid" >/dev/null 2>&1 || true
-  rm -f "$pipe"
-  return $rc
-}
-
-# ---- Main loop ----
-TEMP_FILES=(); trap 'for f in "${TEMP_FILES[@]:-}"; do [[ -e "$f" ]] && rm -f "$f"; done' EXIT INT TERM
-
-TOTAL=${#args[@]}; INDEX=0; OKC=0; FAILED=0; SKIPPED=0
-[[ $QUIET -eq 0 ]] && echo "${APP_TITLE}" && echo "Mode=${OUTMODE}  Target=${TARGET_I} LUFS (TP −1 dBTP)  MP3=${MP3_BITRATE}  FLAC=${FLAC_LEVEL}  SR=${SAMPLE_RATE}"
-
-for IN in "${args[@]}"; do
-  INDEX=$((INDEX+1))
-  if [[ ! -f "$IN" ]]; then echo "Skip (not a file): $IN"; SKIPPED=$((SKIPPED+1)); continue; fi
-
-  BASE="$(basename "$IN")"; SRC_DIR="$(cd "$(dirname "$IN")" && pwd -P)"; OUT_DIR="$SRC_DIR"
-  if [[ ! -w "$OUT_DIR" ]]; then echo "Skip (not writable): $OUT_DIR for ${BASE}"; SKIPPED=$((SKIPPED+1)); continue; fi
-
-  STEM="${BASE%.*}"
-  STEM_TAG="${STEM}-lev-${TARGET_I}LUFS"
-
-  WAV_OUT="${OUT_DIR}/${STEM_TAG}.wav"
-  MP3_OUT="${OUT_DIR}/${STEM_TAG}.mp3"
-  FLAC_OUT="${OUT_DIR}/${STEM_TAG}.flac"
-
-  TMP_WAV="$(hidden_tmp "$OUT_DIR" "$STEM_TAG" "wav")"; TEMP_FILES+=("$TMP_WAV")
-  TMP_MP3="$(hidden_tmp "$OUT_DIR" "$STEM_TAG" "mp3")"
-  TMP_FLAC="$(hidden_tmp "$OUT_DIR" "$STEM_TAG" "flac")"
-
-  echo "--> (${INDEX}/${TOTAL}) $IN"
-  if [[ $DRYRUN -eq 1 ]]; then
-    echo "[dry-run] would render to: $WAV_OUT $MP3_OUT $FLAC_OUT"
-    OKC=$((OKC+1)); continue
-  fi
-
-  # Pass 1 — measure only
-  PASS1_JSON="$(mktemp -t waxoff_pass1.XXXXXX.json 2>/dev/null || echo "/tmp/waxoff_pass1.$RANDOM.json")"
-  "$FFMPEG" -hide_banner -nostats -y -i "$IN" \
-    -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:print_format=json" \
-    -f null - 2> "$PASS1_JSON"
-  P1_RC=$?
-  MEAS_I="$(extract_json_num "$PASS1_JSON" input_i)"
-  MEAS_TP="$(extract_json_num "$PASS1_JSON" input_tp)"
-  MEAS_LRA="$(extract_json_num "$PASS1_JSON" input_lra)"
-  MEAS_THRESH="$(extract_json_num "$PASS1_JSON" input_thresh)"
-  MEAS_OFFSET="$(extract_json_num "$PASS1_JSON" target_offset)"
-  rm -f "$PASS1_JSON" 2>/dev/null || true
-  HAVE_MEAS=0; [[ $P1_RC -eq 0 && -n "${MEAS_I:-}" && -n "${MEAS_TP:-}" && -n "${MEAS_LRA:-}" && -n "${MEAS_THRESH:-}" && -n "${MEAS_OFFSET:-}" ]] && HAVE_MEAS=1
-
-  DUR_RENDER="$(ffprobe_duration_s "$IN")"
-
-  # WAV render with progress
-  if [[ $HAVE_MEAS -eq 1 ]]; then
-    if ! ffmpeg_with_progress "$DUR_RENDER" "render" \
-         -y -i "$IN" \
-         -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:measured_I=${MEAS_I}:measured_TP=${MEAS_TP}:measured_LRA=${MEAS_LRA}:measured_thresh=${MEAS_THRESH}:offset=${MEAS_OFFSET}:linear=true:print_format=summary" \
-         -ar "$SAMPLE_RATE" -c:a pcm_s24le -f wav "$TMP_WAV"
-    then
-      echo "!! WAV render FAILED for: $BASE"; FAILED=$((FAILED+1)); continue
-    fi
-  else
-    if ! ffmpeg_with_progress "$DUR_RENDER" "render" \
-         -y -i "$IN" \
-         -af "loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=${TARGET_LRA}:linear=true:print_format=summary" \
-         -ar "$SAMPLE_RATE" -c:a pcm_s24le -f wav "$TMP_WAV"
-    then
-      echo "!! WAV render FAILED for: $BASE"; FAILED=$((FAILED+1)); continue
-    fi
-  fi
-
-  want_wav=0; want_mp3=0; want_flac=0
-  [[ "$OUTMODE" == "wav" || "$OUTMODE" == "both" || "$OUTMODE" == "wav+flac" || "$OUTMODE" == "all" ]] && want_wav=1
-  [[ "$OUTMODE" == "mp3" || "$OUTMODE" == "both" || "$OUTMODE" == "all" ]] && want_mp3=1
-  [[ "$OUTMODE" == "flac" || "$OUTMODE" == "wav+flac" || "$OUTMODE" == "all" ]] && want_flac=1
-
-  # Reveal WAV if requested
-  if [[ $want_wav -eq 1 ]]; then
-    mv -f "$TMP_WAV" "$WAV_OUT"
-    for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_WAV" ]] && unset 'TEMP_FILES[i]'; done
-  fi
-
-  # MP3 encode with progress
-  if [[ $want_mp3 -eq 1 ]]; then
-    SRC_FOR_MP3="$TMP_WAV"; [[ -f "$WAV_OUT" ]] && SRC_FOR_MP3="$WAV_OUT"
-    TEMP_FILES+=("$TMP_MP3")
-    ENC_DUR="$(ffprobe_duration_s "${WAV_OUT:-$TMP_WAV}")"
-    if ffmpeg_with_progress "$ENC_DUR" "mp3" \
-         -y -i "$SRC_FOR_MP3" -c:a "$MP3_CODEC" -b:a "$MP3_BITRATE" -ar "$SAMPLE_RATE" -ac 2 -f mp3 "$TMP_MP3"
-    then
-      mv -f "$TMP_MP3" "$MP3_OUT"
-      for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_MP3" ]] && unset 'TEMP_FILES[i]'; done
-    else
-      echo "!! MP3 encode FAILED for: $BASE"; FAILED=$((FAILED+1))
-    fi
-  fi
-
-  # FLAC encode with progress
-  if [[ $want_flac -eq 1 ]]; then
-    SRC_FOR_FLAC="$TMP_WAV"; [[ -f "$WAV_OUT" ]] && SRC_FOR_FLAC="$WAV_OUT"
-    TEMP_FILES+=("$TMP_FLAC")
-    ENC_DUR="$(ffprobe_duration_s "${WAV_OUT:-$TMP_WAV}")"
-    if ffmpeg_with_progress "$ENC_DUR" "flac" \
-         -y -i "$SRC_FOR_FLAC" -c:a flac -compression_level "$FLAC_LEVEL" -ar "$SAMPLE_RATE" -f flac "$TMP_FLAC"
-    then
-      mv -f "$TMP_FLAC" "$FLAC_OUT"
-      for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_FLAC" ]] && unset 'TEMP_FILES[i]'; done
-    else
-      echo "!! FLAC encode FAILED for: $BASE"; FAILED=$((FAILED+1))
-    fi
-  fi
-
-  # Spot-check
-  SC_TXT="$(mktemp -t waxoff_sc.XXXXXX.txt 2>/dev/null || echo "/tmp/waxoff_sc.$RANDOM.txt")"
-  if [[ -f "$WAV_OUT" ]]; then
-    spotcheck_file "$WAV_OUT" "$SC_TXT"
-  else
-    spotcheck_file "$TMP_WAV" "$SC_TXT"
-  fi
-  OUTS=()
-  [[ $want_wav -eq 1 ]]  && OUTS+=("$(basename "$WAV_OUT")")
-  [[ $want_mp3 -eq 1 ]] && OUTS+=("$(basename "$MP3_OUT")")
-  [[ $want_flac -eq 1 ]] && OUTS+=("$(basename "$FLAC_OUT")")
-  echo "✓ ${BASE} → ${OUTS[*]}  $(cat "$SC_TXT" 2>/dev/null || echo "")"
-  rm -f "$SC_TXT" 2>/dev/null || true
-
-  # If mp3/flac only, remove hidden WAV temp
-  if [[ $want_wav -eq 0 && -f "$TMP_WAV" ]]; then
-    rm -f "$TMP_WAV"
-    for i in "${!TEMP_FILES[@]}"; do [[ "${TEMP_FILES[$i]}" = "$TMP_WAV" ]] && unset 'TEMP_FILES[i]'; done
-  fi
-
-  OKC=$((OKC+1))
+Examples:
+  waxoff song.wav
+  PROMPT=0 TARGET_I=-16 OUTMODE=wav+flac SAMPLE_RATE=48000 waxoff mix*.wav
+  waxoff --no-prompt -t -18 -m both -s 44100 *.aif
+HLP
+      exit 0 ;;
+    --) shift; break ;;
+    -*) die "Unknown option: $1" ;;
+    *) break ;;
+  esac
 done
 
-[[ $QUIET -eq 0 ]] && echo "Summary: OK=${OKC}  Failed=${FAILED}  Skipped=${SKIPPED} | Version: ${VERSION}"
-echo "======== $(date '+%Y-%m-%d %H:%M:%S') — Run end ========"
-[[ $FAILED -gt 0 ]] && exit 1 || exit 0
+[[ $# -lt 1 ]] && { err "No input files given."; echo "Try: waxoff -h"; exit 1; }
+
+# -------------------- Preflight --------------------
+need ffmpeg
+
+# Normalize/validate options
+case "$TARGET_I" in -18|-16) ;; *) die "TARGET_I must be -18 or -16";; esac
+case "$SAMPLE_RATE" in 44100|48000) ;; *) die "SAMPLE_RATE must be 44100 or 48000";; esac
+case "$OUTMODE" in wav|mp3|both|flac|wav+flac|all) ;; *) die "OUTMODE invalid: $OUTMODE";; esac
+case "$MP3_BITRATE" in 128k|160k|192k) ;; *) die "MP3_BITRATE must be 128k|160k|192k";; esac
+[[ "$FLAC_LEVEL" =~ ^[0-9]+$ ]] || die "FLAC_LEVEL must be 0..12"
+(( FLAC_LEVEL>=0 && FLAC_LEVEL<=12 )) || die "FLAC_LEVEL must be 0..12"
+
+# Interactive selection if requested
+if [[ "${PROMPT}" = "1" ]]; then
+  interactive_prompts
+fi
+
+# -------------------- Core processing --------------------
+process_file() {
+  local in="$1"
+  [[ -f "$in" ]] || { err "Skipping missing file: $in"; return 1; }
+
+  # Stem & out dir
+  local dir base stem
+  dir="$(cd "$(dirname "$in")" && pwd -P)"
+  base="$(basename "$in")"
+  stem="${base%.*}"
+
+  # ---------- Pass 1: measure ----------
+  say "Analyze: $in"
+  if [[ "${DRY_RUN}" = "1" ]]; then
+    say "[DRY] ffmpeg (analyze) $in"
+  else
+    # Collect loudnorm summary (print_format=summary is easier to parse)
+    # We silence audio output (-f null -), capture stderr.
+    pass1_out="$(ffmpeg -hide_banner -nostats -y -i "$in" \
+      -filter_complex "[0:a]loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=11:print_format=summary" \
+      -f null - 2>&1)"
+    if [[ $? -ne 0 ]]; then
+      err "Analysis failed: $in"
+      return 2
+    fi
+  fi
+
+  local I_m TP_m LRA_m TH_m OF_m
+  if [[ "${DRY_RUN}" = "1" ]]; then
+    # Dummy numbers for dry run
+    I_m="-20.0"; TP_m="-2.0"; LRA_m="6.0"; TH_m="-30.0"; OF_m="0.0"
+  else
+    # Parse
+    read -r I_m TP_m LRA_m TH_m OF_m < <(printf '%s\n' "$pass1_out" | parse_loudnorm_summary) || {
+      # Fallback: try JSON format if summary fails (older ffmpeg)
+      read -r I_m TP_m LRA_m TH_m OF_m < <(
+        printf '%s\n' "$pass1_out" |
+        awk -F':' '
+          /"input_i"/      {gsub(/[ ",]/,"",$2); I=$2}
+          /"input_tp"/     {gsub(/[ ",]/,"",$2); TP=$2}
+          /"input_lra"/    {gsub(/[ ",]/,"",$2); LRA=$2}
+          /"input_thresh"/ {gsub(/[ ",]/,"",$2); TH=$2}
+          /"target_offset"/{gsub(/[ ",]/,"",$2); OF=$2}
+          END{ if(I==""||TP==""||LRA==""||TH==""||OF=="") exit 1; print I,TP,LRA,TH,OF }
+        '
+      ) || {
+        err "Could not parse loudnorm analysis for: $in"
+        return 3
+      }
+    }
+  fi
+
+  say "Measured: I=${I_m} LUFS, TP=${TP_m} dBTP, LRA=${LRA_m}, Thresh=${TH_m}, Offset=${OF_m}"
+
+  # ---------- Outputs to produce ----------
+  # WAV path
+  local out_wav="${dir}/${stem}-lvl${TARGET_I}LUFS.wav"
+  # MP3 path
+  local out_mp3="${dir}/${stem}-lvl${TARGET_I}LUFS.mp3"
+  # FLAC path
+  local out_flac="${dir}/${stem}-lvl${TARGET_I}LUFS.flac"
+
+  # ---------- Pass 2: render ----------
+  # Common filter with measured values; linear=true keeps it global/transparent.
+  local loudnorm2="loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=11:measured_I=${I_m}:measured_TP=${TP_m}:measured_LRA=${LRA_m}:measured_thresh=${TH_m}:offset=${OF_m}:linear=true:print_format=summary"
+
+  # WAV
+  if [[ "$OUTMODE" == "wav" || "$OUTMODE" == "both" || "$OUTMODE" == "wav+flac" || "$OUTMODE" == "all" ]]; then
+    say "Render WAV: ${out_wav} @ ${SAMPLE_RATE} Hz"
+    atomic_write "$out_wav" \
+      -i "$in" -map 0:a:0 -vn \
+      -filter:a "$loudnorm2,aresample=${SAMPLE_RATE}" \
+      -c:a pcm_s24le \
+      -ar "${SAMPLE_RATE}" \
+      -dn
+  fi
+
+  # MP3
+  if [[ "$OUTMODE" == "mp3" || "$OUTMODE" == "both" || "$OUTMODE" == "all" ]]; then
+    say "Render MP3: ${out_mp3} (${MP3_BITRATE}) @ ${SAMPLE_RATE} Hz"
+    atomic_write "$out_mp3" \
+      -i "$in" -map 0:a:0 -vn \
+      -filter:a "$loudnorm2,aresample=${SAMPLE_RATE}" \
+      -c:a libmp3lame -b:a "$MP3_BITRATE" -ar "${SAMPLE_RATE}" \
+      -dn
+  fi
+
+  # FLAC
+  if [[ "$OUTMODE" == "flac" || "$OUTMODE" == "wav+flac" || "$OUTMODE" == "all" ]]; then
+    say "Render FLAC: ${out_flac} (level ${FLAC_LEVEL}) @ ${SAMPLE_RATE} Hz"
+    atomic_write "$out_flac" \
+      -i "$in" -map 0:a:0 -vn \
+      -filter:a "$loudnorm2,aresample=${SAMPLE_RATE}" \
+      -c:a flac -compression_level "${FLAC_LEVEL}" -ar "${SAMPLE_RATE}" \
+      -dn
+  fi
+
+  say "OK: $in"
+  return 0
+}
+
+# -------------------- Main loop --------------------
+ok=0
+fail=0
+
+for f in "$@"; do
+  process_file "$f" && ok=$((ok+1)) || fail=$((fail+1))
+done
+
+echo "Result: files OK=${ok}, failed=${fail}"
+[[ $fail -gt 0 ]] && exit 2 || exit 0
