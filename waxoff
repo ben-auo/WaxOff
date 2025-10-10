@@ -4,10 +4,9 @@
 # Outputs: WAV / MP3 (CBR) / FLAC; 44.1 or 48 kHz; atomic writes; interactive or flags.
 #
 # Philosophy: set final loudness only (global gain + TP ceiling). No EQ/comp/gate.
-#
-# Tested on macOS bash 3.2 and Homebrew ffmpeg.
+# This version fixes: prompts/logging not visible due to redirected stdout.
+# All user-facing prompts go to /dev/tty; logs go to ~/Library/Logs/waxoff_cli.log.
 
-# -------------------- Shell & PATH --------------------
 set -u
 IFS=$'\n\t'
 PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH}"; export PATH
@@ -24,22 +23,26 @@ LOG="${LOG:-${HOME}/Library/Logs/waxoff_cli.log}"
 QUIET="${QUIET:-0}"                   # 1 reduces chatter
 DRY_RUN="${DRY_RUN:-0}"               # 1 = plan only
 
-mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
-exec >>"$LOG" 2>&1
-echo ""
-echo "======== $(date '+%Y-%m-%d %H:%M:%S') — WaxOff start ========"
-echo "Args: $*"
-echo "ENV: PROMPT=$PROMPT TARGET_I=$TARGET_I OUTMODE=$OUTMODE MP3_BITRATE=$MP3_BITRATE FLAC_LEVEL=$FLAC_LEVEL SAMPLE_RATE=$SAMPLE_RATE QUIET=$QUIET DRY_RUN=$DRY_RUN"
-command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version | head -n 1
+TTY_DEV="/dev/tty"
+[[ -e "$TTY_DEV" && -r "$TTY_DEV" && -w "$TTY_DEV" ]] || TTY_DEV="/dev/stdout"
 
-say() { [[ "${QUIET}" = "1" ]] && return 0; printf '%s\n' "$*"; }
-err() { printf 'Error: %s\n' "$*" 1>&2; }
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+
+log() { printf '%s\n' "$*" >>"$LOG"; }
+say() { [[ "${QUIET}" = "1" ]] && return 0; printf '%s\n' "$*" >"$TTY_DEV"; log "$*"; }
+warn() { printf 'Warn: %s\n' "$*" >"$TTY_DEV"; log "Warn: $*"; }
+err() { printf 'Error: %s\n' "$*" >"$TTY_DEV" 1>&2; log "Error: $*"; }
 die() { err "$*"; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
+log ""
+log "======== $(date '+%Y-%m-%d %H:%M:%S') — WaxOff start ========"
+log "Args: $*"
+log "ENV: PROMPT=$PROMPT TARGET_I=$TARGET_I OUTMODE=$OUTMODE MP3_BITRATE=$MP3_BITRATE FLAC_LEVEL=$FLAC_LEVEL SAMPLE_RATE=$SAMPLE_RATE QUIET=$QUIET DRY_RUN=$DRY_RUN"
+if command -v ffmpeg >/dev/null 2>&1; then ffmpeg -version | head -n 1 >>"$LOG" 2>&1; fi
+
 # Atomic write: write to a hidden temp in same dir, then mv over
 atomic_write() {
-  # $1 = final_path ; $2.. = args (input/filter/codec); last argument must be the *output* file
   local final="$1"; shift
   local dir base tmp
   dir="$(dirname "$final")"
@@ -47,11 +50,10 @@ atomic_write() {
   tmp="${dir}/.${base}.tmp.$$"
   [[ "${DRY_RUN}" = "1" ]] && { say "[DRY] ffmpeg -> ${final}"; return 0; }
   mkdir -p "$dir" 2>/dev/null || true
-  # Write to tmp
-  ffmpeg -hide_banner -nostdin -y "$@" "$tmp"
+  ffmpeg -hide_banner -nostdin -y "$@" "$tmp" >>"$LOG" 2>&1
   local rc=$?
   if [[ $rc -ne 0 ]]; then
-    err "ffmpeg render failed (rc=$rc) for $final"
+    err "ffmpeg render failed (rc=$rc) for $final (see log)"
     rm -f "$tmp"
     return $rc
   fi
@@ -59,10 +61,8 @@ atomic_write() {
   return 0
 }
 
-# Robust JSON parser using awk (no jq requirement)
+# Parse JSON loudnorm (no jq)
 parse_json_loudnorm() {
-  # stdin: ffmpeg stderr containing a JSON block (print_format=json)
-  # outputs: I TP LRA TH OF  (space-separated)
   awk '
     BEGIN{ I=TP=LRA=TH=OF="" }
     /"input_i"/      { gsub(/[^0-9\.\-]/,"",$2); I=$2 }
@@ -76,28 +76,33 @@ parse_json_loudnorm() {
     }'
 }
 
+prompt_read() {
+  # $1 message, sets global REPLY
+  printf '%s' "$1" >"$TTY_DEV"
+  # Read from TTY explicitly so pipes don’t block
+  IFS= read -r REPLY <"$TTY_DEV"
+}
+
 interactive_prompts() {
-  # Target
   printf '%s\n' "Select loudness target (TP = −1.0 dBTP):
   1) −18 LUFS (recommended)
-  2) −16 LUFS"
-  read -r -p "Enter 1-2 (default 1): " ans
-  case "${ans:-1}" in
+  2) −16 LUFS" >"$TTY_DEV"
+  prompt_read "Enter 1-2 (default 1): "
+  case "${REPLY:-1}" in
     1) TARGET_I="-18" ;;
     2) TARGET_I="-16" ;;
     *) TARGET_I="-18" ;;
   esac
 
-  # Mode
   printf '%s\n' "Choose output mode:
   1) wav
   2) mp3
   3) both (wav+mp3)
   4) flac
   5) wav+flac
-  6) all (wav+mp3+flac)"
-  read -r -p "Enter 1-6 (default 3): " ans
-  case "${ans:-3}" in
+  6) all (wav+mp3+flac)" >"$TTY_DEV"
+  prompt_read "Enter 1-6 (default 3): "
+  case "${REPLY:-3}" in
     1) OUTMODE="wav" ;;
     2) OUTMODE="mp3" ;;
     3) OUTMODE="both" ;;
@@ -107,14 +112,13 @@ interactive_prompts() {
     *) OUTMODE="both" ;;
   esac
 
-  # MP3 bitrate if relevant
   if [[ "${OUTMODE}" == "mp3" || "${OUTMODE}" == "both" || "${OUTMODE}" == "all" ]]; then
     printf '%s\n' "MP3 bitrate:
     1) 128k
     2) 160k (recommended)
-    3) 192k"
-    read -r -p "Enter 1-3 (default 2): " ans
-    case "${ans:-2}" in
+    3) 192k" >"$TTY_DEV"
+    prompt_read "Enter 1-3 (default 2): "
+    case "${REPLY:-2}" in
       1) MP3_BITRATE="128k" ;;
       2) MP3_BITRATE="160k" ;;
       3) MP3_BITRATE="192k" ;;
@@ -122,30 +126,31 @@ interactive_prompts() {
     esac
   fi
 
-  # Sample rate
   printf '%s\n' "Sample rate:
   1) 44100 Hz (default)
-  2) 48000 Hz"
-  read -r -p "Enter 1-2 (default 1): " ans
-  case "${ans:-1}" in
+  2) 48000 Hz" >"$TTY_DEV"
+  prompt_read "Enter 1-2 (default 1): "
+  case "${REPLY:-1}" in
     1) SAMPLE_RATE="44100" ;;
     2) SAMPLE_RATE="48000" ;;
     *) SAMPLE_RATE="44100" ;;
   esac
 
-  echo ""
-  echo "Selections:"
-  printf "  Target:  %3s LUFS (TP −1 dBTP)\n" "${TARGET_I}"
-  printf "  Mode:    %s\n" "${OUTMODE}"
-  if [[ "${OUTMODE}" == "mp3" || "${OUTMODE}" == "both" || "${OUTMODE}" == "all" ]]; then
-    printf "  MP3:     %s\n" "${MP3_BITRATE}"
-  fi
-  printf "  Sample:  %s Hz\n" "${SAMPLE_RATE}"
+  {
+    echo ""
+    echo "Selections:"
+    printf "  Target:  %3s LUFS (TP −1 dBTP)\n" "${TARGET_I}"
+    printf "  Mode:    %s\n" "${OUTMODE}"
+    if [[ "${OUTMODE}" == "mp3" || "${OUTMODE}" == "both" || "${OUTMODE}" == "all" ]]; then
+      printf "  MP3:     %s\n" "${MP3_BITRATE}"
+    fi
+    printf "  Sample:  %s Hz\n" "${SAMPLE_RATE}"
+  } >"$TTY_DEV"
 
-  read -r -p "Proceed? [Y/n]: " go
-  case "${go:-Y}" in
+  prompt_read "Proceed? [Y/n]: "
+  case "${REPLY:-Y}" in
     Y|y|"") : ;;
-    *) echo "Aborted."; exit 1 ;;
+    *) printf '%s\n' "Aborted." >"$TTY_DEV"; exit 1 ;;
   esac
 }
 
@@ -162,7 +167,7 @@ while [[ $# -gt 0 ]]; do
     -q|--quiet) QUIET=1; shift ;;
     -n|--dry-run) DRY_RUN=1; shift ;;
     -h|--help)
-      cat <<'HLP'
+      cat <<'HLP' >"$TTY_DEV"
 WaxOff — Final Mix Loudness Leveler
 Usage: waxoff [options] <files...>
 
@@ -185,7 +190,7 @@ HLP
   esac
 done
 
-[[ $# -lt 1 ]] && { err "No input files given."; echo "Try: waxoff -h"; exit 1; }
+[[ $# -lt 1 ]] && { err "No input files given. Try: waxoff -h"; exit 1; }
 
 # -------------------- Preflight --------------------
 need ffmpeg
@@ -216,14 +221,11 @@ process_file() {
   if [[ "${DRY_RUN}" = "1" ]]; then
     I_m="-20.0"; TP_m="-2.0"; LRA_m="6.0"; TH_m="-30.0"; OF_m="0.0"
   else
-    # Pass 1: print JSON to stderr; grab it
-    # NOTE: -f null - to avoid writing output; we capture stderr
-    pass1="$(ffmpeg -hide_banner -nostats -y -i "$in" \
+    pass1="$(ffmpeg -hide_banner -nostats -nostdin -y -i "$in" \
       -filter_complex "[0:a]loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=11:print_format=json" \
       -f null - 2>&1)"
-    # Parse JSON from the whole stderr (no jq)
     if ! read -r I_m TP_m LRA_m TH_m OF_m < <(printf '%s\n' "$pass1" | parse_json_loudnorm); then
-      say "Warn: JSON parse failed; falling back to one-pass loudnorm."
+      warn "JSON parse failed; using one-pass loudnorm."
       I_m=""; TP_m=""; LRA_m=""; TH_m=""; OF_m=""
     fi
   fi
@@ -234,7 +236,6 @@ process_file() {
   local out_mp3="${dir}/${stem}-lvl${TARGET_I}LUFS.mp3"
   local out_flac="${dir}/${stem}-lvl${TARGET_I}LUFS.flac"
 
-  # Build loudnorm second-pass (or single-pass if fallback)
   local loud2
   if [[ -n "${I_m}" ]]; then
     loud2="loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=11:measured_I=${I_m}:measured_TP=${TP_m}:measured_LRA=${LRA_m}:measured_thresh=${TH_m}:offset=${OF_m}:linear=true:print_format=summary"
@@ -249,7 +250,7 @@ process_file() {
       -i "$in" -map 0:a:0 -vn \
       -filter:a "${loud2},aresample=${SAMPLE_RATE}:resampler=soxr" \
       -c:a pcm_s24le -ar "${SAMPLE_RATE}" \
-      -nostdin -dn
+      -dn -nostdin
   fi
 
   # MP3
@@ -259,7 +260,7 @@ process_file() {
       -i "$in" -map 0:a:0 -vn \
       -filter:a "${loud2},aresample=${SAMPLE_RATE}:resampler=soxr" \
       -c:a libmp3lame -b:a "${MP3_BITRATE}" -ar "${SAMPLE_RATE}" \
-      -nostdin -dn
+      -dn -nostdin
   fi
 
   # FLAC
@@ -269,7 +270,7 @@ process_file() {
       -i "$in" -map 0:a:0 -vn \
       -filter:a "${loud2},aresample=${SAMPLE_RATE}:resampler=soxr" \
       -c:a flac -compression_level "${FLAC_LEVEL}" -ar "${SAMPLE_RATE}" \
-      -nostdin -dn
+      -dn -nostdin
   fi
 
   say "OK: $in"
@@ -279,15 +280,10 @@ process_file() {
 ok=0
 fail=0
 
-if [[ "${PROMPT}" = "1" && $# -gt 0 ]]; then
-  : # prompts already ran above
-fi
-
-need ffmpeg
-
 for f in "$@"; do
   process_file "$f" && ok=$((ok+1)) || fail=$((fail+1))
 done
 
-echo "Result: files OK=${ok}, failed=${fail}"
+printf 'Result: files OK=%d, failed=%d\n' "$ok" "$fail" >"$TTY_DEV"
+log "Result: files OK=${ok}, failed=${fail}"
 [[ $fail -gt 0 ]] && exit 2 || exit 0
