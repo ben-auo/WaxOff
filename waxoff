@@ -45,7 +45,6 @@ atomic_write() {
   tmp="${dir}/.${stem}.tmp.$$.$ext"
   [[ "${DRY_RUN}" = "1" ]] && { say "[DRY] ffmpeg ($fmt) -> ${final}"; return 0; }
   mkdir -p "$dir" 2>/dev/null || true
-  # Place -f *before output* so it doesn't affect input demuxer
   ffmpeg -hide_banner -nostdin -y "$@" -f "$fmt" "$tmp" >>"$LOG" 2>&1
   local rc=$?
   if [[ $rc -ne 0 ]]; then
@@ -198,7 +197,9 @@ case "$MP3_BITRATE" in 128k|160k|192k) ;; *) die "MP3_BITRATE must be 128k|160k|
 [[ "$FLAC_LEVEL" =~ ^[0-9]+$ ]] || die "FLAC_LEVEL must be 0..12"
 test "$FLAC_LEVEL" -ge 0 -a "$FLAC_LEVEL" -le 12 || die "FLAC_LEVEL must be 0..12"
 
+# After prompts (if any), show the wait/confirmation notice
 if [[ "${PROMPT}" = "1" ]]; then interactive_prompts; fi
+say "⏳ Processing started — please wait for the final confirmation line ('Result: files OK=…, failed=…') before closing this window or moving files."
 
 # -------------------- Analysis --------------------
 analyze_file() {
