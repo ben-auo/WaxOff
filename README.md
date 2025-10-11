@@ -77,12 +77,6 @@ PROMPT=0 TARGET_I=-18 OUTMODE=all SAMPLE_RATE=48000 MP3_BITRATE=192k waxoff *.wa
 
 ---
 
-## About (for GitHub sidebar)
-
-A command‑line **finisher** for delivery‑ready podcast masters. Performs transparent two‑pass loudness normalization to **−18 or −16 LUFS** with a **−1 dBTP** ceiling, then exports **WAV, MP3, and/or FLAC**—consistent, headroom‑safe outputs with interactive prompts and atomic writes.
-
----
-
 ## License
 
 MIT © Seven Morris
