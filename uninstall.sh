@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# Uninstall symlink for this tool only (keeps repo)
-set -euo pipefail
-IFS=$'\n\t'
+set -Eeuo pipefail
 
-EXE_NAME="${EXE_NAME:-waxon}"  # override to 'waxoff' inside WaxOff repo
+DEST="${HOME}/WaxOff"
+BIN_DIR="${HOME}/bin/waxoff"
+ALT_BIN="${HOME}/.local/bin/waxoff"
 
-choose_bin_dir() {
-  if [[ -d "${HOME}/bin" ]]; then echo "${HOME}/bin"
-  elif [[ -d "${HOME}/.local/bin" ]]; then echo "${HOME}/.local/bin"
-  else echo ""; fi
-}
-BIN_DIR="$(choose_bin_dir)"
+echo "==> Uninstalling WaxOff..."
 
-if [[ -n "${BIN_DIR}" && -e "${BIN_DIR}/${EXE_NAME}" ]]; then
-  rm -f "${BIN_DIR}/${EXE_NAME}"
-  echo "✓ Removed ${BIN_DIR}/${EXE_NAME}"
-else
-  echo "Nothing to remove."
+removed_any=0
+for link in "${BIN_DIR}" "${ALT_BIN}"; do
+  if [[ -L "${link}" || -f "${link}" ]]; then
+    rm -f "${link}" && echo "Removed ${link}" && removed_any=1
+  fi
+done
+if [[ "${removed_any}" -eq 0 ]]; then
+  echo "No symlinks found in ~/bin or ~/.local/bin."
 fi
 
-echo "✅ Uninstall complete (symlink only)."
+if [[ -d "${DEST}" ]]; then
+  rm -rf "${DEST}"
+  echo "Removed ${DEST}"
+fi
+
+echo "==> Uninstalled."

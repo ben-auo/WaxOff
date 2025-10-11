@@ -1,79 +1,53 @@
-# WaxOff — Final Mix Loudness Leveler (WAV / MP3 / FLAC)
+# WaxOff — Stereo Podcast Leveler
 
-**Purpose:** WaxOff finalizes stereo mixes to consistent broadcast/podcast loudness using transparent two‑pass **EBU R128 / BS.1770** normalization and a **−1 dBTP** safety ceiling, then exports **WAV, MP3, and/or FLAC**. Ideal as the last step before delivery.
+WaxOff sets **final program loudness** and exports deliverables after editing. It uses a two‑pass EBU R128‐style loudness normalization (ffmpeg `loudnorm`) with a **true‑peak ceiling of −1 dBTP** and common targets like **−18 LUFS** or **−16 LUFS**.
 
-> For pre‑mix prep (mono WAV with limiter‑only chain for editing), see **[WaxOn](https://github.com/sevmorris/WaxOn)**.
-
----
-
-## Features
-
-- Two‑pass `loudnorm` to **−18 LUFS** (default) or **−16 LUFS**
-- True‑peak safety ceiling **−1 dBTP**
-- Deliverables: **WAV 24‑bit**, **CBR MP3** (128/160/192 kbps), **FLAC** (level 0–12)
-- Choose sample rate **44.1 kHz (default)** or 48 kHz
-- **Interactive prompts** (or scriptable with flags/env)
-- **macOS file picker** when launched without args
-- **Atomic writes** with hidden temps
-- Minimal deps: `bash`, `ffmpeg`
+> Use **WaxOn** *before editing* to produce clean, unclipped mono WAVs for the DAW. Use **WaxOff** *after editing* to hit delivery targets.
 
 ---
 
 ## Install (one‑liner)
 
-Installs to `~/WaxOff` and symlinks `waxoff` into `~/bin` (or `~/.local/bin`).
+Installs to `~/WaxOff` and symlinks `waxoff` into `~/bin` (or `~/.local/bin`):
 
-```bash
+```sh
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/sevmorris/WaxOff/main/install.sh)"
 ```
 
-> Ensure `~/bin` is on your `PATH` (see WaxOn README for examples).
+If a proxy/CDN is serving a cached copy, try this cache‑busting variant:
+
+```sh
+/bin/bash -c "$(curl -fsSL "https://raw.githubusercontent.com/sevmorris/WaxOff/main/install.sh?nocache=$(date +%s)")"
+```
+
+Ensure your shell can find `~/bin` (or `~/.local/bin`):
+```sh
+# zsh
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc && exec zsh
+# bash
+echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bash_profile && source ~/.bash_profile
+```
 
 ---
 
-## Usage
+## Usage (quick start)
 
-### Interactive
-
-```bash
+```sh
 waxoff *.wav
 ```
-
-Prompts for:
-
-- Target loudness: **−18** or **−16 LUFS**
-- Output mode: `wav` | `mp3` | `both` | `flac` | `wav+flac` | `all`
-- MP3 bitrate: 128k, **160k**, 192k
-- FLAC compression: **8** by default (0–12)
-- Sample rate: **44.1 kHz** or 48 kHz
-
-### Non‑interactive
-
-```bash
-# flags
-waxoff --no-prompt -t -18 -m wav+flac -b 192k -s 48000 *.aif
-
-# or via env
-PROMPT=0 TARGET_I=-18 OUTMODE=all SAMPLE_RATE=48000 MP3_BITRATE=192k waxoff *.wav
-```
-
-#### Common flags
-
-- `-t, --target <LUFS>`: `-18` (default) or `-16`
-- `-m, --mode <mode>`: `wav | mp3 | both | flac | wav+flac | all` (default `both`)
-- `-b, --bitrate <rate>`: `128k | 160k | 192k` (MP3 CBR; default `160k`)
-- `-s, --samplerate <hz>`: `44100 | 48000` (default `44100`)
-- `--flac-level <0..12>`: FLAC compression level (default `8`)
-- `-l, --log <path>`: log file path (default `~/Library/Logs/waxoff_cli.log`)
-- `--no-prompt`, `-q`, `-n`: as in WaxOn
+Typical prompts (or flags/envs if non‑interactive):
+- Loudness target (e.g., −18 or −16 LUFS)
+- True‑peak ceiling: −1 dBTP
+- Output: WAV, MP3 (128/160/192), or Both
+- Sample rate: 44.1 kHz (default) or 48 kHz
 
 ---
 
-## Workflow
+## Troubleshooting
 
-1. Mix in DAW → bounce stereo WAV (24‑bit recommended)
-2. **WaxOff** → pick target loudness and deliverables
-3. Deliver masters (WAV/MP3/FLAC)
+- **`BASH_SOURCE[0]: unbound variable`** — You pulled a cached installer. Re‑run the cache‑busting one‑liner above.
+- **`waxoff` not found** — Add `~/bin` (or `~/.local/bin`) to your PATH (see Install section).
+- **`ffmpeg: command not found`** — Install ffmpeg first (macOS: `brew install ffmpeg`).
 
 ---
 

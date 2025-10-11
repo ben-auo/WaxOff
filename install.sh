@@ -1,46 +1,51 @@
 #!/usr/bin/env bash
-# WaxOff per-repo installer: clone to ~/WaxOff and symlink 'waxoff'
-set -euo pipefail
-IFS=$'\n\t'
+set -Eeuo pipefail
 
 REPO_URL="https://github.com/sevmorris/WaxOff.git"
-REPO_NAME="WaxOff"
-EXE_NAME="waxoff"
+DEST="${HOME}/WaxOff"
+BIN_DIR="${HOME}/bin"
+ALT_BIN="${HOME}/.local/bin"
+LINK_NAME="waxoff"
 
-choose_bin_dir() {
-  if [[ -d "${HOME}/bin" ]]; then echo "${HOME}/bin"
-  elif [[ -d "${HOME}/.local/bin" ]]; then echo "${HOME}/.local/bin"
-  else mkdir -p "${HOME}/bin"; echo "${HOME}/bin"; fi
-}
-BIN_DIR="$(choose_bin_dir)"
+echo "==> Installing WaxOff to ${DEST} and symlinking ${LINK_NAME}..."
 
-case ":${PATH}:" in *:"${BIN_DIR}":*) ;; *)
-  echo "⚠️  ${BIN_DIR} not in PATH. Add: export PATH=\"${BIN_DIR}:\$PATH\"";;
-esac
+command -v git >/dev/null 2>&1 || { echo "Error: git is required."; exit 1; }
 
-DEST="${HOME}/${REPO_NAME}"
 if [[ -d "${DEST}/.git" ]]; then
-  echo "→ Updating ${REPO_NAME} in ${DEST}"
-  git -C "${DEST}" fetch --quiet --all
-  git -C "${DEST}" pull --quiet --rebase || git -C "${DEST}" pull --quiet
+  echo "==> Updating existing repo..."
+  git -C "${DEST}" pull --ff-only
 else
-  echo "→ Cloning ${REPO_NAME} to ${DEST}"
+  echo "==> Cloning repo..."
   git clone --depth=1 "${REPO_URL}" "${DEST}"
 fi
 
-find_exec() {
-  local d="$1" n="$2"
-  for p in "${d}/${n}" "${d}/${n}.sh" "${d}/scripts/${n}" "${d}/scripts/${n}.sh" "${d}/bin/${n}" "${d}/bin/${n}.sh"; do
-    [[ -f "$p" ]] && { echo "$p"; return 0; }
-  done
-  return 1
-}
-
-SRC="$(find_exec "${DEST}" "${EXE_NAME}")" || {
-  echo "❌ Could not find ${EXE_NAME}{,.sh} in repo root/scripts/bin."
+if [[ ! -f "${DEST}/${LINK_NAME}" ]]; then
+  echo "Error: ${LINK_NAME} not found at ${DEST}/${LINK_NAME}"
   exit 1
-}
+fi
 
-chmod +x "${SRC}"
-ln -sfn "${SRC}" "${BIN_DIR}/${EXE_NAME}"
-echo "✅ Installed: ${EXE_NAME} -> ${SRC}"
+chmod +x "${DEST}/${LINK_NAME}"
+
+# Prefer ~/.local/bin if it exists; otherwise use ~/bin
+if [[ -d "${ALT_BIN}" ]]; then
+  INSTALL_BIN="${ALT_BIN}"
+else
+  INSTALL_BIN="${BIN_DIR}"
+fi
+mkdir -p "${INSTALL_BIN}"
+
+ln -sf "${DEST}/${LINK_NAME}" "${INSTALL_BIN}/${LINK_NAME}"
+echo "==> Symlinked ${INSTALL_BIN}/${LINK_NAME}"
+
+# Helpful hints
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Note: ffmpeg not found. Install it (e.g., 'brew install ffmpeg' on macOS)."
+fi
+
+if ! command -v "${LINK_NAME}" >/dev/null 2>&1; then
+  echo "Add to PATH: export PATH=\"${INSTALL_BIN}:$PATH\""
+fi
+
+# Friendly probe (non-fatal)
+"${INSTALL_BIN}/${LINK_NAME}" --version >/dev/null 2>&1 || true
+echo "==> Done."
