@@ -2,7 +2,7 @@
 
 WaxOff sets **final program loudness** and exports deliverables after editing. It uses a two‑pass EBU R128‐style loudness normalization (ffmpeg `loudnorm`) with a **true‑peak ceiling of −1 dBTP** and common targets like **−18 LUFS** or **−16 LUFS**.
 
-> Use **WaxOn** *before editing* to produce clean, unclipped mono WAVs for the DAW. Use **WaxOff** *after editing* to hit delivery targets.
+> Use [**WaxOn**](https://github.com/sevmorris/WaxOn) *before editing* to produce clean, unclipped mono WAVs for the DAW. Use **WaxOff** *after editing* to hit delivery targets.
 
 ---
 
