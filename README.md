@@ -14,12 +14,6 @@ Installs to `~/WaxOff` and symlinks `waxoff` into `~/bin` (or `~/.local/bin`):
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/sevmorris/WaxOff/main/install.sh)"
 ```
 
-If a proxy/CDN is serving a cached copy, try this cache‑busting variant:
-
-```sh
-/bin/bash -c "$(curl -fsSL "https://raw.githubusercontent.com/sevmorris/WaxOff/main/install.sh?nocache=$(date +%s)")"
-```
-
 Ensure your shell can find `~/bin` (or `~/.local/bin`):
 ```sh
 # zsh
@@ -45,7 +39,6 @@ Typical prompts (or flags/envs if non‑interactive):
 
 ## Troubleshooting
 
-- **`BASH_SOURCE[0]: unbound variable`** — You pulled a cached installer. Re‑run the cache‑busting one‑liner above.
 - **`waxoff` not found** — Add `~/bin` (or `~/.local/bin`) to your PATH (see Install section).
 - **`ffmpeg: command not found`** — Install ffmpeg first (macOS: `brew install ffmpeg`).
 
