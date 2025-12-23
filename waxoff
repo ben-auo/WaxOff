@@ -258,7 +258,7 @@ for INFILE in "$@"; do
   LRA_m=$(echo "$p1" | grep 'input_lra' | tr -dc '0-9.-')
   TH_m=$(echo "$p1" | grep 'input_thresh' | tr -dc '0-9.-')
   OF_m=$(echo "$p1" | grep 'target_offset' | tr -dc '0-9.-')
-  
+
   if [ -n "$I_m" ] && [ -n "$TP_m" ] && [ -n "$LRA_m" ] && [ -n "$TH_m" ] && [ -n "$OF_m" ]; then
     say "Measured: I=${I_m} LUFS, TP=${TP_m} dBTP, LRA=${LRA_m}"
     LOUD2="loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=11:measured_I=${I_m}:measured_TP=${TP_m}:measured_LRA=${LRA_m}:measured_thresh=${TH_m}:offset=${OF_m}:linear=true:print_format=summary"
@@ -267,13 +267,15 @@ for INFILE in "$@"; do
     LOUD2="loudnorm=I=${TARGET_I}:TP=${TARGET_TP}:LRA=11:linear=true:print_format=summary"
   fi
 
-  DIR="$(cd "$(dirname "$INFILE")" && pwd -P)"
+  DIR="$(cd "$(dirname "$INFILE")" && pwd -P)/normalized-lvl${TARGET_I}LUFS"
+  mkdir -p "$DIR"
+
   BASE="$(basename "$INFILE")"
   STEM="${BASE%.*}"
 
-  OUT_WAV="${DIR}/${STEM}-lvl${TARGET_I}LUFS.wav"
-  OUT_MP3="${DIR}/${STEM}-lvl${TARGET_I}LUFS.mp3"
-  OUT_FLAC="${DIR}/${STEM}-lvl${TARGET_I}LUFS.flac"
+  OUT_WAV="${DIR}/${STEM}.wav"
+  OUT_MP3="${DIR}/${STEM}.mp3"
+  OUT_FLAC="${DIR}/${STEM}.flac"
 
   want_wav=0; want_mp3=0; want_flac=0
   case "$OUTMODE" in
