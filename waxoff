@@ -11,7 +11,7 @@ PROMPT="${PROMPT:-1}"                 # 1=interactive menus, 0=flags/env only
 TARGET_I="${TARGET_I:--18}"           # -18 or -16
 TARGET_TP="${TARGET_TP:--1.0}"        # true-peak safety
 OUTMODE="${OUTMODE:-both}"            # wav | mp3 | both | flac | wav+flac | all
-MP3_BITRATE="${MP3_BITRATE:-160k}"    # 128k | 160k | 192k
+MP3_BITRATE="${MP3_BITRATE:-160k}"    # 128k | 160k | 192k / 320k
 FLAC_LEVEL="${FLAC_LEVEL:-8}"         # 0..12
 SAMPLE_RATE="${SAMPLE_RATE:-44100}"   # 44100 | 48000
 LOG="${LOG:-${HOME}/Library/Logs/waxoff_cli.log}"
@@ -119,12 +119,14 @@ interactive_prompts() {
     printf '%s\n' "MP3 bitrate:
     1) 128k
     2) 160k (recommended)
-    3) 192k" >"$TTY_DEV"
+    3) 192k
+    4) 320k" >"$TTY_DEV"
     prompt_read "Enter 1-3 (default 2): "
     case "${REPLY:-2}" in
       1) MP3_BITRATE="128k" ;;
       2) MP3_BITRATE="160k" ;;
       3) MP3_BITRATE="192k" ;;
+      4) MP3_BITRATE="320k" ;;
       *) MP3_BITRATE="160k" ;;
     esac
   fi
@@ -171,7 +173,7 @@ Options:
   --no-prompt             Non-interactive (use flags/env)
   -t, --target <LUFS>     -18 (default) | -16
   -m, --mode <mode>       wav | mp3 | both | flac | wav+flac | all   (default: both)
-  -b, --bitrate <rate>    128k | 160k | 192k (MP3; default 160k)
+  -b, --bitrate <rate>    128k | 160k | 192k | 320k (MP3; default 160k)
   -s, --samplerate <hz>   44100 | 48000 (default 44100)
       --flac-level <N>    0..12 (default 8)
   -l, --log <path>        Log file path (default ~/Library/Logs/waxoff_cli.log)
@@ -193,7 +195,7 @@ need ffmpeg
 case "$TARGET_I" in -18|-16) ;; *) die "TARGET_I must be -18 or -16";; esac
 case "$SAMPLE_RATE" in 44100|48000) ;; *) die "SAMPLE_RATE must be 44100 or 48000";; esac
 case "$OUTMODE" in wav|mp3|both|flac|wav+flac|all) ;; *) die "OUTMODE invalid: $OUTMODE";; esac
-case "$MP3_BITRATE" in 128k|160k|192k) ;; *) die "MP3_BITRATE must be 128k|160k|192k";; esac
+case "$MP3_BITRATE" in 128k|160k|192k|320k) ;; *) die "MP3_BITRATE must be 128k|160k|192k|320k";; esac
 [[ "$FLAC_LEVEL" =~ ^[0-9]+$ ]] || die "FLAC_LEVEL must be 0..12"
 test "$FLAC_LEVEL" -ge 0 -a "$FLAC_LEVEL" -le 12 || die "FLAC_LEVEL must be 0..12"
 
